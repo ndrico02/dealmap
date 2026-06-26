@@ -1089,6 +1089,10 @@ svg.leaflet-image-layer.leaflet-interactive path {
           <button class="btn sm" id="btnImportComps" style="justify-content:center">Import comps</button>
         </div>
         <div class="hint" style="margin-top:8px">Loaded comps: <b id="totalComps">0</b> · <a class="link" id="btnCompFormat">CSV format</a> · <a class="link" id="btnSampleComps">Load sample set</a></div>
+        <button class="btn sm" id="btnReport" style="width:100%; justify-content:center; margin-top:11px">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 3v18h18"/><rect x="7" y="12" width="3" height="5"/><rect x="12" y="8" width="3" height="9"/><rect x="17" y="14" width="3" height="3"/></svg>
+          Export market report (Excel)
+        </button>
       </div>
 
       <!-- BENCHMARKS PANE -->
@@ -2192,6 +2196,201 @@ function loadSampleBenchmarks(){
 }
 
 /* ============================================================================
+   12C. MARKET REPORT — Excel export (ExcelJS lazy-loaded from CDN on demand)
+   ========================================================================== */
+const REPORT_COLORS=["#2e7d46","#1f6feb","#8957e5","#d99a2b","#e8743b","#0891b2","#d9536b","#6b8e23","#9c6ade","#c2410c","#2aa198","#b1581f"];
+let _xljs=null;
+function loadExcelJS(){
+  if(typeof ExcelJS!=="undefined") return Promise.resolve(ExcelJS);
+  if(_xljs) return _xljs;
+  _xljs=new Promise((res,rej)=>{
+    const s=document.createElement("script");
+    s.src="https://cdnjs.cloudflare.com/ajax/libs/exceljs/4.4.0/exceljs.min.js";
+    s.onload=()=>{ if(typeof ExcelJS!=="undefined") res(ExcelJS); else rej(new Error("Excel engine loaded but unavailable")); };
+    s.onerror=()=>rej(new Error("Couldn't load the Excel engine — check your connection and retry."));
+    document.head.appendChild(s);
+  });
+  return _xljs;
+}
+function reportColorMap(names){ const m={}; names.forEach((n,i)=>m[n]=REPORT_COLORS[i%REPORT_COLORS.length]); return m; }
+function compNet(c){ return c.netPrice!=null?c.netPrice:c.salePrice; }
+function pmtMonthly(net,a){
+  if(net==null) return null;
+  const loan=net*(1-(a.downPct||0)/100), r=(a.rate/100)/12, n=360;
+  const pi = r>0 ? loan*r*Math.pow(1+r,n)/(Math.pow(1+r,n)-1) : loan/n;
+  return pi + net*((a.taxPct||0)/100)/12 + (a.hoa||0);
+}
+function compsForReport(){ return (State.research.polygon? compsInPolygon() : State.comps.slice()).filter(c=>compNet(c)!=null); }
+function buildReportModel(a){
+  const comps=compsForReport();
+  const byC={}; comps.forEach(c=>{ const k=c.community||"(Uncategorized)"; (byC[k]=byC[k]||[]).push(c); });
+  const names=Object.keys(byC).sort((x,y)=>x.localeCompare(y));
+  const colors=reportColorMap(names);
+  const communities=names.map(n=>{
+    const list=byC[n].slice().sort((p,q)=>(p.sqft||0)-(q.sqft||0));
+    const nets=list.map(compNet).filter(v=>v!=null), psfs=list.map(ppsf).filter(v=>v!=null),
+      sfs=list.map(c=>c.sqft).filter(v=>v!=null), pmts=list.map(c=>pmtMonthly(compNet(c),a)).filter(v=>v!=null);
+    return { name:n, color:colors[n], comps:list, count:list.length,
+      medNet:median(nets), medPsf:median(psfs), medSf:median(sfs), medPmt:median(pmts),
+      minNet:nets.length?Math.min.apply(null,nets):null, maxNet:nets.length?Math.max.apply(null,nets):null,
+      minSf:sfs.length?Math.min.apply(null,sfs):null, maxSf:sfs.length?Math.max.apply(null,sfs):null };
+  });
+  return { assumptions:a, comps, communities, colors, scope:(State.research.polygon?"Analysis area":"All loaded comps"), generated:new Date() };
+}
+function niceBounds(mn,mx){ if(mn===mx) return [mn*0.95||0, mx*1.05||1]; const pad=(mx-mn)*0.08; return [mn-pad, mx+pad]; }
+function drawScatterPNG(model){
+  const pts=[]; model.comps.forEach(c=>{ const net=compNet(c); if(c.sqft&&net!=null) pts.push({sf:c.sqft,net:net,color:model.colors[c.community||"(Uncategorized)"],comm:c.community||"(Uncategorized)"}); });
+  if(pts.length<1) return null;
+  const W=920,H=560, P={l:96,r:28,t:56,b:118};
+  const cv=document.createElement("canvas"); cv.width=W; cv.height=H; const g=cv.getContext("2d");
+  g.fillStyle="#ffffff"; g.fillRect(0,0,W,H);
+  const xs=pts.map(p=>p.sf), ys=pts.map(p=>p.net);
+  const [x0,x1]=niceBounds(Math.min.apply(null,xs),Math.max.apply(null,xs));
+  const [y0,y1]=niceBounds(Math.min.apply(null,ys),Math.max.apply(null,ys));
+  const X=v=>P.l+(v-x0)/(x1-x0)*(W-P.l-P.r), Y=v=>H-P.b-(v-y0)/(y1-y0)*(H-P.t-P.b);
+  g.fillStyle="#0d141c"; g.font="700 18px -apple-system,Segoe UI,Roboto,sans-serif"; g.textAlign="left"; g.fillText("Net Price vs. Size",P.l,34);
+  g.font="11px -apple-system,Segoe UI,Roboto,sans-serif";
+  for(let i=0;i<=5;i++){ const v=y0+(y1-y0)*i/5, yy=Y(v); g.strokeStyle="#e7ecf1"; g.lineWidth=1; g.beginPath(); g.moveTo(P.l,yy); g.lineTo(W-P.r,yy); g.stroke(); g.fillStyle="#6c7d8e"; g.textAlign="right"; g.fillText("$"+Math.round(v/1000)+"K",P.l-8,yy+4); }
+  for(let i=0;i<=6;i++){ const v=x0+(x1-x0)*i/6, xx=X(v); g.strokeStyle="#eef2f6"; g.beginPath(); g.moveTo(xx,P.t); g.lineTo(xx,H-P.b); g.stroke(); g.fillStyle="#6c7d8e"; g.textAlign="center"; g.fillText(Math.round(v).toLocaleString(),xx,H-P.b+18); }
+  g.fillStyle="#46566a"; g.font="600 12px -apple-system,Segoe UI,Roboto,sans-serif"; g.textAlign="center"; g.fillText("Square feet",(P.l+W-P.r)/2,H-P.b+40);
+  g.save(); g.translate(24,(P.t+H-P.b)/2); g.rotate(-Math.PI/2); g.fillText("Net price",0,0); g.restore();
+  if(pts.length>=3){ const n=pts.length; let sx=0,sy=0,sxy=0,sxx=0; pts.forEach(p=>{sx+=p.sf;sy+=p.net;sxy+=p.sf*p.net;sxx+=p.sf*p.sf;});
+    const m=(n*sxy-sx*sy)/(n*sxx-sx*sx), b=(sy-m*sx)/n;
+    if(isFinite(m)){ g.strokeStyle="#9aa7b4"; g.lineWidth=1.5; g.setLineDash([6,5]); g.beginPath(); g.moveTo(X(x0),Y(m*x0+b)); g.lineTo(X(x1),Y(m*x1+b)); g.stroke(); g.setLineDash([]); } }
+  pts.forEach(p=>{ g.beginPath(); g.arc(X(p.sf),Y(p.net),5,0,Math.PI*2); g.fillStyle=p.color; g.globalAlpha=0.92; g.fill(); g.globalAlpha=1; g.lineWidth=1; g.strokeStyle="#0b1118"; g.stroke(); });
+  const present=[...new Set(pts.map(p=>p.comm))];
+  g.font="12px -apple-system,Segoe UI,Roboto,sans-serif"; g.textAlign="left"; let lx=P.l, ly=H-56;
+  present.forEach(nm=>{ g.fillStyle=model.colors[nm]; g.beginPath(); g.arc(lx+5,ly-4,5,0,Math.PI*2); g.fill(); g.strokeStyle="#0b1118"; g.lineWidth=1; g.stroke();
+    g.fillStyle="#33455a"; const label=nm.length>24?nm.slice(0,22)+"…":nm; g.fillText(label,lx+15,ly); lx+=g.measureText(label).width+42; if(lx>W-200){ lx=P.l; ly+=20; } });
+  return cv.toDataURL("image/png");
+}
+function drawLocatorPNG(model){
+  const pts=[]; model.comps.forEach(c=>{ if(c.lat!=null&&c.lng!=null) pts.push({lat:c.lat,lng:c.lng,color:model.colors[c.community||"(Uncategorized)"],comm:c.community||"(Uncategorized)"}); });
+  if(pts.length<2) return null;
+  const W=920,H=600, P={l:30,r:30,t:54,b:118};
+  const cv=document.createElement("canvas"); cv.width=W; cv.height=H; const g=cv.getContext("2d");
+  g.fillStyle="#0f141b"; g.fillRect(0,0,W,H);
+  const lats=pts.map(p=>p.lat), kx=Math.cos(((Math.min.apply(null,lats)+Math.max.apply(null,lats))/2)*Math.PI/180);
+  const px=pts.map(p=>p.lng*kx);
+  const x0=Math.min.apply(null,px), x1=Math.max.apply(null,px), y0=Math.min.apply(null,lats), y1=Math.max.apply(null,lats);
+  const bw=W-P.l-P.r, bh=H-P.t-P.b, sc=Math.min(bw/((x1-x0)||1e-3), bh/((y1-y0)||1e-3))*0.9;
+  const cx=(x0+x1)/2, cy=(y0+y1)/2, X=v=>W/2+(v-cx)*sc, Y=v=>(P.t+H-P.b)/2-(v-cy)*sc;
+  g.fillStyle="#e7eef5"; g.font="700 18px -apple-system,Segoe UI,Roboto,sans-serif"; g.textAlign="left"; g.fillText("Comp Locations by Community",P.l,34);
+  g.strokeStyle="rgba(255,255,255,.06)"; for(let i=0;i<=8;i++){ const gx=P.l+bw*i/8; g.beginPath(); g.moveTo(gx,P.t); g.lineTo(gx,H-P.b); g.stroke(); }
+  pts.forEach(p=>{ g.beginPath(); g.arc(X(p.lng*kx),Y(p.lat),5,0,Math.PI*2); g.fillStyle=p.color; g.fill(); g.strokeStyle="#0b1118"; g.lineWidth=1; g.stroke(); });
+  const present=[...new Set(pts.map(p=>p.comm))];
+  g.font="12px -apple-system,Segoe UI,Roboto,sans-serif"; g.textAlign="left"; let lx=P.l, ly=H-66;
+  present.forEach(nm=>{ g.fillStyle=model.colors[nm]; g.beginPath(); g.arc(lx+5,ly-4,5,0,Math.PI*2); g.fill(); g.fillStyle="#c7d2dd"; const label=nm.length>24?nm.slice(0,22)+"…":nm; g.fillText(label,lx+15,ly); lx+=g.measureText(label).width+44; if(lx>W-200){ lx=P.l; ly+=20; } });
+  g.fillStyle="#6c7d8e"; g.font="11px -apple-system,Segoe UI,Roboto,sans-serif"; g.fillText("Relative positions (no basemap) — the interactive aerial map lives in the app.",P.l,H-26);
+  return cv.toDataURL("image/png");
+}
+function argb(hex){ return "FF"+hex.replace("#","").toUpperCase(); }
+async function exportExcelReport(a){
+  let XL;
+  try{ toast("Loading Excel engine…",""); XL=await loadExcelJS(); }
+  catch(e){ toast(e.message,"err"); return; }
+  const model=buildReportModel(a);
+  if(!model.comps.length){ toast("No comps to report — import or drop some first.","err"); return; }
+  try{
+    const wb=new XL.Workbook(); wb.creator="ParkTerra DealMap"; wb.created=new Date();
+    const NAVY=argb("#0d141c"), LINE=argb("#d9e1e8"), SOFT=argb("#f3f6f9"), MUT="FF6C7D8E", MONEY='"$"#,##0', SF='#,##0';
+    const dt=model.generated, dstr=(dt.getMonth()+1)+"/"+dt.getDate()+"/"+dt.getFullYear();
+    const A=model.assumptions;
+    const hcell=(cell,txt,align)=>{ cell.value=txt; cell.fill={type:"pattern",pattern:"solid",fgColor:{argb:NAVY}}; cell.font={bold:true,color:{argb:"FFFFFFFF"},size:10.5}; cell.alignment={horizontal:align||"right",vertical:"middle"}; };
+
+    /* Summary */
+    const s=wb.addWorksheet("Summary",{views:[{showGridLines:false}]});
+    s.columns=[{width:30},{width:10},{width:15},{width:13},{width:13},{width:16},{width:16},{width:12}];
+    s.mergeCells("A1:H1"); let c=s.getCell("A1"); c.value="ParkTerra DealMap — Market Report"; c.font={bold:true,size:16,color:{argb:NAVY}};
+    s.mergeCells("A2:H2"); c=s.getCell("A2"); c.value=model.scope+"   ·   "+model.comps.length+" comps   ·   generated "+dstr; c.font={size:10.5,color:{argb:MUT}};
+    s.mergeCells("A3:H3"); c=s.getCell("A3"); c.value="Payment basis: "+A.rate+"% rate · "+A.downPct+"% down · "+A.taxPct+"% tax · $"+A.hoa+"/mo HOA · 30-yr amortization"; c.font={size:10.5,italic:true,color:{argb:MUT}};
+    s.mergeCells("A5:H5"); c=s.getCell("A5"); c.value="Summary by community"; c.font={bold:true,size:12,color:{argb:NAVY}};
+    const sh=s.getRow(6); ["Community","Comps","Median net","Median $/SF","Median PMT","SF range","Net range","Median SF"].forEach((h,i)=>hcell(sh.getCell(i+1),h,i===0?"left":"right")); sh.height=20;
+    let r=7;
+    model.communities.forEach((cm,idx)=>{
+      const row=s.getRow(r);
+      const nm=row.getCell(1); nm.value=cm.name; nm.font={bold:true,size:11}; nm.border={left:{style:"thick",color:{argb:argb(cm.color)}}};
+      const set=(i,v,fmt)=>{ const cc=row.getCell(i); cc.value=(v==null?"—":v); if(v!=null&&fmt) cc.numFmt=fmt; cc.alignment={horizontal:"right"}; };
+      row.getCell(2).value=cm.count; row.getCell(2).alignment={horizontal:"right"};
+      set(3,cm.medNet,MONEY); set(4,cm.medPsf!=null?Math.round(cm.medPsf):null,MONEY); set(5,cm.medPmt!=null?Math.round(cm.medPmt):null,MONEY);
+      row.getCell(6).value=cm.minSf!=null?cm.minSf.toLocaleString()+"–"+cm.maxSf.toLocaleString():"—"; row.getCell(6).alignment={horizontal:"right"};
+      row.getCell(7).value=cm.minNet!=null?"$"+Math.round(cm.minNet/1000)+"K–$"+Math.round(cm.maxNet/1000)+"K":"—"; row.getCell(7).alignment={horizontal:"right"};
+      set(8,cm.medSf,SF);
+      if(idx%2===1) for(let i=2;i<=8;i++) row.getCell(i).fill={type:"pattern",pattern:"solid",fgColor:{argb:SOFT}};
+      r++;
+    });
+    for(let rr=6;rr<r;rr++) for(let i=1;i<=8;i++){ const cc=s.getRow(rr).getCell(i); cc.border=Object.assign({},cc.border,{bottom:{style:"thin",color:{argb:LINE}}}); }
+
+    /* Charts */
+    const ch=wb.addWorksheet("Charts",{views:[{showGridLines:false}]});
+    ch.getCell("A1").value="Net Price vs. Size"; ch.getCell("A1").font={bold:true,size:13,color:{argb:NAVY}};
+    const scatter=drawScatterPNG(model);
+    if(scatter){ const id=wb.addImage({base64:scatter,extension:"png"}); ch.addImage(id,{tl:{col:0,row:2},ext:{width:740,height:451}}); }
+    else { ch.getCell("A3").value="No comps have square footage yet — add SF to plot the scatter (resale listings usually include it)."; ch.getCell("A3").font={italic:true,color:{argb:MUT}}; }
+    const loc=drawLocatorPNG(model);
+    if(loc){ ch.getCell("A26").value="Comp Locations"; ch.getCell("A26").font={bold:true,size:13,color:{argb:NAVY}}; const id2=wb.addImage({base64:loc,extension:"png"}); ch.addImage(id2,{tl:{col:0,row:27},ext:{width:740,height:489}}); }
+
+    /* Payment detail */
+    const p=wb.addWorksheet("Payment detail",{views:[{showGridLines:false,state:"frozen",ySplit:4}]});
+    p.columns=[{width:28},{width:26},{width:9},{width:14},{width:9},{width:10},{width:10},{width:8},{width:14},{width:12}];
+    p.mergeCells("A1:J1"); c=p.getCell("A1"); c.value="Payment detail — all comps"; c.font={bold:true,size:14,color:{argb:NAVY}};
+    p.mergeCells("A2:J2"); c=p.getCell("A2"); c.value=A.rate+"% · 30-yr · "+A.downPct+"% down · "+A.taxPct+"% tax · $"+A.hoa+"/mo HOA"; c.font={size:10.5,italic:true,color:{argb:MUT}};
+    const ph=p.getRow(4); ["Community","Address","SF","Net price","$/SF","Tax/mo","HOA/mo","Down","Monthly PMT","Sale date"].forEach((h,i)=>hcell(ph.getCell(i+1),h,i<=1?"left":"right")); ph.height=20;
+    let pr=5;
+    model.communities.forEach(cm=>{
+      cm.comps.forEach(cp=>{
+        const net=compNet(cp), row=p.getRow(pr);
+        row.getCell(1).value=cm.name; row.getCell(1).border={left:{style:"thick",color:{argb:argb(cm.color)}}};
+        row.getCell(2).value=cp.address||"";
+        const set=(i,v,fmt)=>{ const cc=row.getCell(i); cc.value=(v==null||v===""?"—":v); if(v!=null&&v!==""&&fmt) cc.numFmt=fmt; cc.alignment={horizontal:"right"}; };
+        set(3,cp.sqft,SF); set(4,net,MONEY); set(5,ppsf(cp)!=null?Math.round(ppsf(cp)):null,MONEY);
+        set(6,net!=null?Math.round(net*(A.taxPct/100)/12):null,MONEY); set(7,A.hoa,MONEY);
+        row.getCell(8).value=A.downPct+"%"; row.getCell(8).alignment={horizontal:"right"};
+        set(9,pmtMonthly(net,A)!=null?Math.round(pmtMonthly(net,A)):null,MONEY);
+        row.getCell(10).value=cp.saleDate||""; row.getCell(10).alignment={horizontal:"right"};
+        pr++;
+      });
+      const mr=p.getRow(pr); mr.getCell(2).value="▸ "+cm.name+" — median"; mr.getCell(2).font={bold:true,italic:true,size:10,color:{argb:NAVY}};
+      const mset=(i,v,fmt)=>{ const cc=mr.getCell(i); if(v!=null){ cc.value=v; if(fmt) cc.numFmt=fmt; } cc.alignment={horizontal:"right"}; cc.font={bold:true,size:10}; };
+      mset(3,cm.medSf,SF); mset(4,cm.medNet,MONEY); mset(5,cm.medPsf!=null?Math.round(cm.medPsf):null,MONEY); mset(9,cm.medPmt!=null?Math.round(cm.medPmt):null,MONEY);
+      for(let i=1;i<=10;i++){ mr.getCell(i).fill={type:"pattern",pattern:"solid",fgColor:{argb:SOFT}}; mr.getCell(i).border={top:{style:"thin",color:{argb:LINE}},bottom:{style:"thin",color:{argb:LINE}}}; }
+      pr+=2;
+    });
+
+    /* Raw */
+    const raw=wb.addWorksheet("Comps (raw)",{views:[{showGridLines:false,state:"frozen",ySplit:1}]});
+    raw.columns=[{width:22},{width:26},{width:10},{width:13},{width:13},{width:9},{width:9},{width:11},{width:12},{width:11},{width:11},{width:12}];
+    const rhh=raw.getRow(1); ["Community","Address","Product","Net price","Sale price","SF","$/SF","Lot (sf)","Sale date","Lat","Lng","Source"].forEach((h,i)=>hcell(rhh.getCell(i+1),h,i<=2?"left":"right")); rhh.height=18;
+    let r2=2;
+    model.comps.forEach(cp=>{ const row=raw.getRow(r2++), net=compNet(cp);
+      row.getCell(1).value=cp.community||""; row.getCell(2).value=cp.address||""; row.getCell(3).value=cp.productType||"";
+      const set=(i,v,fmt)=>{ const cc=row.getCell(i); if(v!=null&&v!==""){ cc.value=v; if(fmt) cc.numFmt=fmt; } cc.alignment={horizontal:"right"}; };
+      set(4,net,MONEY); set(5,cp.salePrice,MONEY); set(6,cp.sqft,SF); set(7,ppsf(cp)!=null?Math.round(ppsf(cp)):null,MONEY);
+      set(8,lotSqft(cp)!=null?Math.round(lotSqft(cp)):null,SF); row.getCell(9).value=cp.saleDate||"";
+      row.getCell(10).value=cp.lat!=null?cp.lat:""; row.getCell(11).value=cp.lng!=null?cp.lng:""; row.getCell(12).value=cp.source||"";
+    });
+
+    const buf=await wb.xlsx.writeBuffer();
+    downloadBlob("ParkTerra-Market-Report-"+dateStamp()+".xlsx", new Blob([buf],{type:"application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"}));
+    toast("Market report exported","ok");
+  }catch(err){ toast("Report failed: "+err.message,"err"); }
+}
+function downloadBlob(name,blob){ const u=URL.createObjectURL(blob); const a=document.createElement("a"); a.href=u; a.download=name; document.body.appendChild(a); a.click(); a.remove(); setTimeout(()=>URL.revokeObjectURL(u),1500); }
+function openReportDialog(){
+  const n=compsForReport().length;
+  if(!n){ switchTab("research"); toast("No comps yet — import or drop some first, then export the report.","err"); return; }
+  modal("Market report (Excel)",
+    '<div class="hint" style="margin-bottom:14px">Builds a formatted workbook from the <b>'+n+'</b> comp(s) '+(State.research.polygon?'in your analysis area':'loaded')+' — summary by community, a payment table, and a Net Price vs. size scatter. Set your payment assumptions:</div>'+
+    '<div class="row2"><label class="fld"><span class="lbl">Mortgage rate %</span><input id="rpRate" type="number" step="0.125" value="6.5"></label>'+
+      '<label class="fld"><span class="lbl">Down payment %</span><input id="rpDown" type="number" step="1" value="15"></label></div>'+
+    '<div class="row2"><label class="fld"><span class="lbl">Property tax %</span><input id="rpTax" type="number" step="0.05" value="1.25"></label>'+
+      '<label class="fld"><span class="lbl">HOA $/mo</span><input id="rpHoa" type="number" step="10" value="350"></label></div>'+
+    '<div class="hint">Tax % and HOA apply to every comp (loaded comps don\u2019t carry their own). For CFD-heavy areas, raise the tax % to your effective rate.</div>',
+    [{label:"Cancel",cls:"",fn:closeModal},
+     {label:"Generate Excel",cls:"primary",fn:()=>{ const a={ rate:Number(val("rpRate"))||6.5, downPct:Number(val("rpDown"))||0, taxPct:Number(val("rpTax"))||0, hoa:Number(val("rpHoa"))||0 }; closeModal(); exportExcelReport(a); }}]);
+}
+
+/* ============================================================================
    13. UTILS
    ========================================================================== */
 function uid(){ return Date.now().toString(36)+Math.random().toString(36).slice(2,7); }
@@ -2399,6 +2598,7 @@ async function init(){
   document.getElementById("btnImportComps").onclick=openImportDialog;
   document.getElementById("btnCompFormat").onclick=showCompFormat;
   document.getElementById("btnSampleComps").onclick=loadSampleComps;
+  document.getElementById("btnReport").onclick=openReportDialog;
   document.getElementById("btnExportComps").onclick=()=>{
     const cs=State.research.compsIn.length?State.research.compsIn:State.comps;
     const header="address,lat,lng,product_type,sale_price,net_price,sqft,lot_size,lot_unit,sale_date,community,source\n";
